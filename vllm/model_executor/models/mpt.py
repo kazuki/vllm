@@ -10,9 +10,10 @@ from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig
 from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
-from vllm.model_executor.layers.activation import get_act_fn
+from vllm.model_executor.layers.activation import GeluAndMul, get_act_fn
 from vllm.model_executor.layers.layernorm import NORM_CLASS_REGISTRY
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+                                               MergedColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -148,7 +149,7 @@ class MPTMLP(nn.Module):
         super().__init__()
         hidden_size = config.d_model
         expansion_ratio = config.expansion_ratio
-        intermediate_size = expansion_ratio * hidden_size
+        intermediate_size = int(expansion_ratio * hidden_size)
         self.up_proj = ColumnParallelLinear(
             hidden_size,
             intermediate_size,
@@ -170,6 +171,43 @@ class MPTMLP(nn.Module):
         return x
 
 
+class MPTGLU(nn.Module):
+
+    def __init__(
+        self,
+        config: MPTConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
+        super().__init__()
+        hidden_size = config.d_model
+        intermediate_size = int(config.expansion_ratio * hidden_size)
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=not config.no_bias,
+            quant_config=quant_config,
+        )
+        self.act = GeluAndMul()
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=not config.no_bias,
+            quant_config=quant_config,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+
+FFN_CLASS_REGISTRY = {
+    'mptmlp': MPTMLP,
+    'mptglu': MPTGLU,
+}
+
+
 class MPTBlock(nn.Module):
 
     def __init__(
@@ -184,7 +222,8 @@ class MPTBlock(nn.Module):
         self.norm_1 = norm_class(hidden_size)
         self.attn = MPTAttention(config, cache_config, quant_config)
         self.norm_2 = norm_class(hidden_size)
-        self.ffn = MPTMLP(config, quant_config)
+        self.ffn = FFN_CLASS_REGISTRY[config.ffn_config["ffn_type"]](
+            config, quant_config)
 
     def forward(
         self,
@@ -322,14 +361,37 @@ class MPTForCausalLM(nn.Module, SupportsPP):
         return next_tokens
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
+
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
-            # Skip loading extra bias for GPTQ models.
-            if name.endswith(".bias") and name not in params_dict:
-                continue
-            if is_pp_missing_parameter(name, self):
-                continue
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader",
-                                    default_weight_loader)
-            weight_loader(param, loaded_weight)
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                stacked_name = name.replace(weight_name, param_name)
+                if stacked_name not in params_dict:
+                    continue
+                # Skip loading extra bias for GPTQ models.
+                if stacked_name.endswith(".bias"):
+                    continue
+                if is_pp_missing_parameter(stacked_name, self):
+                    continue
+
+                param = params_dict[stacked_name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if is_pp_missing_parameter(name, self):
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                weight_loader(param, loaded_weight)
