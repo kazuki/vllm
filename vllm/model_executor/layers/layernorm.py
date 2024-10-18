@@ -8,8 +8,7 @@ from vllm.model_executor.custom_op import CustomOp
 
 
 def _cast_if_autocast_enabled(
-    tensor: Optional[torch.Tensor],
-) -> Optional[torch.Tensor]:
+        tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     if tensor is not None and torch.is_autocast_enabled():
         return tensor.to(dtype=torch.get_autocast_dtype(tensor.device.type))
     return tensor
